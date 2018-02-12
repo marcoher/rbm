@@ -2,7 +2,7 @@ from __future__ import division, print_function
 import tensorflow as tf
 import numpy as np
 
-implemented = ["binary"] # TODO: implement gaussian, binomial, etc
+implemented = ["binary", "gaussian"] # TODO: implement binomial, etc
 
 class rbm(object):
   """
@@ -19,7 +19,7 @@ class rbm(object):
 
     assert (isinstance(visible_dim,int) and visible_dim>0),"visible_dim must be a positive integer: %s" % visible_dim
     assert (isinstance(hidden_dim, int) and hidden_dim>0 ),"hidden_dim must be a positive integer: %s" % hidden_dim
-    assert visible_type.strip().lower() in implemented,"type of visible units is not implemented: %s (expected in %s)" % (visible_type, implemented)
+    assert visible_type.strip().lower() in implemented,"visible_type is not implemented: %s (expected in %s)" % (visible_type, implemented)
     assert isinstance(seed, int),"seed must be an integer: %s" % seed
     assert isinstance(name, str),"name must be a string: %s" % name
 
@@ -29,16 +29,18 @@ class rbm(object):
     self.visible_type = visible_type.strip().lower()
     self.name         = name
     self.cd_steps     = None
-    self.graph        = None
+    self.trained      = False
+    self.model_files  = "./tmp/" + name + ".ckpt"
+    self._build()
 
-  def fit(self, data, max_epochs = 1000, learning_rate = 0.1, cd_steps = 1, verbosity = 100):
+  def fit(self, data, max_epochs = 1000, learning_rate = 0.1, cd_steps = 1, verbose = 100):
     """
     Fit the model to a dataset
     data          : a numpy array of shape [num_samples, visible_dim]
     max_epochs    : optional, maximum number of epochs to use in training, default is 1000
     learning_rate : optional, learning rate to use in training, default is 0.1
     cd_steps      : optional, number of contrastive divergence steps, default is 1
-    verbosity     : optional, print reconstruction error every verbosity epochs, default is 100
+    verbosity     : optional, print reconstruction error every verbose epochs, default is 100
     """
 
     assert isinstance(data, np.ndarray),"data must be a numpy array: %s" % data
@@ -46,24 +48,31 @@ class rbm(object):
     assert (isinstance(max_epochs, int) and max_epochs>0),"max_epochs must be a positive integer: %s" % max_epochs
     assert (isinstance(learning_rate, float) and learning_rate>0),"learning_rate must be a positive floating point number: %s" % learning_rate
     assert (isinstance(cd_steps, int) and cd_steps>0),"cd_steps must a positive ingeger: %s" % cd_steps
-    assert (isinstance(verbosity, int) and verbosity>0),"verbosity must be a positive integer: %s" % verbosity
-
-    if not self.graph:  self._build()
+    assert (isinstance(verbose, int) and verbose>0),"verbose must be a positive integer: %s" % verbose
 
     self._training_ops(cd_steps)
 
     train_dict = {self.visible : data, self.lr : learning_rate, self.N : data.shape[0]}
 
     with tf.Session(graph=self.graph) as sess:
-      sess.run(self.init)
+      if self.trained:
+        self.saver.restore(sess, self.model_files)
+      else:
+        sess.run(self.init)
+
       for epoch in xrange(max_epochs):
         sess.run(self.update, feed_dict = train_dict)
-        if epoch % verbosity == 0:
-            error = sess.run(self.reconstruction_error, feed_dict = train_dict)
-            print("Epoch %d/%d: reconstruction error = %.8f" % (epoch, max_epochs, error))
+        if epoch % verbose == 0:
+            error, free_energy = sess.run([self.reconstruction_error, self.avg_free_energy],
+                                          feed_dict = {self.visible : data})
+            print("Epoch %d/%d:\nreconstruction error = %.6f, free energy = %8.4f" % (epoch, max_epochs, error, free_energy))
+      saved_path = self.saver.save(sess, self.model_files)
 
-    print("\nTraining complete.\n")
-    print("Number of samples: %d, learning rate: %8.4f, cd steps: %d\n" % (data.shape[0], learning_rate, cd_steps))
+    self.trained = True
+    print("\nTraining complete. Model saved in: %s\n" % saved_path)
+    print("Number of samples: %d, learning rate: %.6f, cd steps: %d\n" % (data.shape[0], learning_rate, cd_steps))
+
+
 
   def generate(self, num_samples = 1, iters = 1):
     """
@@ -75,17 +84,33 @@ class rbm(object):
     assert (isinstance(num_samples, int) and num_samples>0),"num_samples must be a positive integer: %s" % num_samples
     assert (isinstance(iters, int) and iters>0),"iters must be a positive integer: %s" % iters
 
-    if not self.graph:  self._build()
-
     hidden_seed = np.random.random_integers(0, 1, (num_samples, self.hidden_dim))
 
     with tf.Session(graph=self.graph) as sess:
-      sess.run(self.init)
+      if self.trained:
+        self.saver.restore(sess, self.model_files)
+      else:
+        sess.run(self.init)
       for _ in xrange(iters):
           visible = sess.run(self.visible_sample, feed_dict={self.hidden : hidden_seed})
           hidden_seed = sess.run(self.hidden_sample, feed_dict={self.visible : visible})
 
     return visible
+
+  def free_energy(self, v, average=True):
+    """
+    Free energy of a visible vector
+    v : an array of shape [:, visible_dim]
+    """
+    with tf.Session(graph=self.graph) as sess:
+      if self.trained:
+        self.saver.restore(sess, self.model_files)
+      else:
+        sess.run(self.init)
+      if average:
+        return sess.run(self.avg_free_energy, feed_dict={self.visible : v})
+      else:
+        return sess.run(self.free_energy_op, feed_dict={self.visible : v})
 
   def _build(self):
     """
@@ -98,22 +123,26 @@ class rbm(object):
       self._variables()
       self._random_units()
       self.visible_sample, self.visible_means = self._conditional_v_sample(self.hidden)
-      self.hidden_sample,  self.hidden_probs  = self._conditional_h_sample(self.visible)
+      self.hidden_sample,  self.hidden_probs, self.hidden_acts  = self._conditional_h_sample(self.visible)
+      self._free_energy_op()
       self.init = tf.global_variables_initializer()
+      self.saver = tf.train.Saver()
 
   def _units(self):
     """
     Set the data type of the visible units
     """
-    # TODO: this part has to be changed to other types of visible units
-    if self.visible_type in ["binary"]:
+    #this should be extended to account for other types of visible units
+    if self.visible_type == "binary":
       self.visible_dtype = tf.uint8
+    elif self.visible_type == "gaussian":
+      self.visible_dtype = tf.float32
 
   def _variables(self):
     """
     Variables of the model
     """
-    with tf.name_scope("variables"):
+    with tf.variable_scope("variables") as scope:
       self.weights = tf.get_variable(
                   name = "weights",
                   shape = [self.visible_dim, self.hidden_dim],
@@ -154,16 +183,24 @@ class rbm(object):
     Add ops to the main graph to sample values of the visible units given h
     h : a tensor of shape [:, hidden_dim], must already be in the graph
     """
-    # TODO : change this for other types of visible units
+    #this should be extended to account for other types of visible units
     with tf.name_scope("visible_given_hidden"):
-      v_means  = tf.sigmoid(
-                    tf.matmul(tf.cast(h, tf.float32), tf.transpose(self.weights)) + self.v_bias,
-                    name = "visible_means")
+      v_acts = tf.add(tf.matmul(tf.cast(h, tf.float32), tf.transpose(self.weights)),
+                      self.v_bias,
+                      name="visible_activations")
 
-      v_sample = tf.where(tf.random_uniform(tf.shape(v_means)) - v_means < 0,
-                          tf.ones_like(v_means, dtype = self.visible_dtype),
-                          tf.zeros_like(v_means, dtype = self.visible_dtype),
-                          name = "visible_sample")
+      if self.visible_type=="binary":
+        v_means  = tf.sigmoid(v_acts, name = "visible_means")
+
+        v_sample = tf.where(tf.random_uniform(tf.shape(v_means)) - v_means < 0,
+                            tf.ones_like(v_means, dtype = self.visible_dtype),
+                            tf.zeros_like(v_means, dtype = self.visible_dtype),
+                            name = "visible_sample")
+
+      elif self.visible_type=="gaussian":
+        v_means  = tf.identity(v_acts, name = "visible_means")
+
+        v_sample = tf.add(v_means, tf.truncated_normal(), name = "visible_sample")
 
     return v_sample, v_means
 
@@ -173,23 +210,21 @@ class rbm(object):
     v : a tensor of shape [:, visible_dim], must already be in the graph
     """
     with tf.name_scope("hidden_given_visible"):
-      h_probs  = tf.sigmoid(
-                    tf.matmul(tf.cast(v, tf.float32), self.weights) + self.h_bias,
-                    name = "hidden_probs")
-
+      h_acts   = tf.add(tf.matmul(tf.cast(v, tf.float32), self.weights), self.h_bias, name="hidden_activations")
+      h_probs  = tf.sigmoid(h_acts, name = "hidden_probs")
       h_sample = tf.where(tf.random_uniform(tf.shape(h_probs)) - h_probs < 0,
                           tf.ones_like(h_probs, dtype = tf.uint8),
                           tf.zeros_like(h_probs, dtype = tf.uint8),
                           name = "hidden_sample")
 
-    return h_sample, h_probs
+    return h_sample, h_probs, h_acts
 
   def _training_ops(self, k):
     """
     Add ops to the main graph to perform k-step Contrasting Divergence updates
     k : number of steps in contrastive divergence (cannot be modified)
     """
-    #TODO : find a way to use tf graphs so that cd_steps/k can be modified
+    #TODO : implement this so that multiple calls can use different k
     if self.cd_steps:   return None
 
     with self.graph.as_default():
@@ -200,14 +235,14 @@ class rbm(object):
       h0 = self.hidden_sample
 
       v1, v1_means = self._conditional_v_sample(h0)
-      h1, h1_probs = self._conditional_h_sample(v1)
+      h1, h1_probs,_ = self._conditional_h_sample(v1)
 
       self.reconstruction_error = tf.losses.mean_squared_error(v0, v1)
 
       for _ in xrange(k-1):
         v0, h0 = v1, h1
         v1, v1_means = self._conditional_v_sample(h0)
-        h1, h1_probs = self._conditional_h_sample(v1)
+        h1, h1_probs,_ = self._conditional_h_sample(v1)
 
       grad_w = ( tf.matmul(tf.transpose(tf.cast(self.visible, tf.float32)), self.hidden_probs)\
                - tf.matmul(tf.transpose(tf.cast(v1, tf.float32)), h1_probs)    ) / tf.cast(self.N, tf.float32)
@@ -221,3 +256,14 @@ class rbm(object):
       bw_update = self.h_bias.assign_add( self.lr * grad_bh)
 
       self.update = [w_update, bv_update, bw_update]
+
+  def _free_energy_op(self):
+    """
+    Add ops to compute the free energy of a visible vector
+    """
+    with tf.name_scope("free_energy"):
+      self.free_energy_op = - tf.add(tf.tensordot(tf.cast(self.visible, tf.float32), self.v_bias, axes=[[-1],[0]]),
+                                     tf.reduce_sum(tf.log(1.0 + tf.exp(self.hidden_acts)), axis=-1),
+                                     name = "free_energy")
+
+      self.avg_free_energy = tf.reduce_mean(self.free_energy_op)

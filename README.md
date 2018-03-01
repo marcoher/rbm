@@ -1,4 +1,4 @@
-#Restriced Boltzmann Machines with Tensorflow
+# Restriced Boltzmann Machines with Tensorflow
 
 We implement a Boltzmann Machine-like model with three layers, without internal connections, and where the energy functional is invariant under permutation of two of the layers.
 
